@@ -41,12 +41,18 @@ class TestDataset(Dataset):
 def collate_fn(batch):
     return tuple(zip(*batch))
 
+import argparse
+
 def main():
+    parser = argparse.ArgumentParser(description="Generate submission for ESA Kaggle Competition")
+    parser.add_argument('--model', type=str, default='data/advanced_depoisoned_model.pth', help='Path to the de-poisoned model weights')
+    args = parser.parse_args()
+
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Using device: {device}")
 
     # Load unlearned model
-    checkpoint_path = 'data/depoisoned_model.pth'
+    checkpoint_path = args.model
     if not os.path.exists(checkpoint_path):
         print(f"Error: {checkpoint_path} not found. Did you run the training script?")
         return
