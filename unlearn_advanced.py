@@ -1,11 +1,12 @@
 import os
+import argparse
+import copy
 import torch
+import torch.nn as nn
 import torchvision
 from torch.utils.data import Dataset, DataLoader
 import numpy as np
 from PIL import Image
-import copy
-import torch.nn as nn
 
 class UnlearnDataset(Dataset):
     def __init__(self, img_dir):
@@ -23,11 +24,9 @@ class UnlearnDataset(Dataset):
         image_tensor = torch.tensor(image_np)
         if len(image_tensor.shape) == 2:
             image_tensor = image_tensor.unsqueeze(0)
-            
         if image_tensor.shape[0] == 1:
             image_tensor = image_tensor.repeat(3, 1, 1)
 
-        # Empty target for unlearning focal loss
         target = {
             "boxes": torch.zeros((0, 4), dtype=torch.float32),
             "labels": torch.zeros(0, dtype=torch.int64)
@@ -37,67 +36,71 @@ class UnlearnDataset(Dataset):
 def collate_fn(batch):
     return tuple(zip(*batch))
 
-def prune_high_activations(model, data_loader, device, prune_ratio=0.01):
-    """
-    Surgically prunes the top highly activated neurons in the classification head 
-    which are likely responsible for detecting the poison trigger.
-    """
-    print("Running forward pass to identify poison-trigger neurons for pruning...")
-    model.eval()
+def prune_taylor_expansion(model, data_loader, device, prune_ratio):
+    print("Running forward and backward pass to identify poison-trigger neurons via ActivationxGradient...")
+    model.train() # Must be in train mode for backward pass
     
     activations = []
     
     def hook_fn(m, i, o):
-        # Average activation over spatial dimensions and batch
-        activations.append(o.abs().mean(dim=(0, 2, 3)).cpu().detach())
+        o.retain_grad()
+        activations.append(o)
         
-    handles = []
     target_layer = None
     for name, module in model.head.classification_head.named_modules():
         if isinstance(module, nn.Conv2d):
             target_layer = module
-            handles.append(module.register_forward_hook(hook_fn))
-            break # Just hook the first Conv2d in the cls head
+            h = module.register_forward_hook(hook_fn)
+            break
 
     if target_layer is None:
         print("Warning: Could not find Conv2d in classification head to prune.")
         return model
 
-    with torch.no_grad():
-        for images, targets in data_loader:
-            images = list(image.to(device) for image in images)
-            model(images)
+    model.zero_grad()
+    for images, targets in data_loader:
+        images = list(image.to(device) for image in images)
+        targets = [{k: v.to(device) for k, v in t.items()} for t in targets]
+        loss_dict = model(images, targets)
+        loss = sum(l for l in loss_dict.values())
+        loss.backward()
             
-    for h in handles:
-        h.remove()
-        
-    if not activations:
-        return model
-        
-    mean_activations = torch.stack(activations).mean(dim=0)
+    h.remove()
     
-    num_channels = mean_activations.shape[0]
+    scores = torch.zeros(target_layer.out_channels, device=device)
+    for act in activations:
+        if act.grad is not None:
+            # Taylor Expansion Score: |Activation * Gradient|
+            score = (act * act.grad).abs().mean(dim=(0, 2, 3))
+            scores += score
+            
+    num_channels = scores.shape[0]
     num_prune = max(1, int(num_channels * prune_ratio))
-    _, top_indices = torch.topk(mean_activations, num_prune)
+    _, top_indices = torch.topk(scores, num_prune)
     
-    print(f"Pruning top {num_prune}/{num_channels} channels in the classification head...")
+    print(f"Pruning top {num_prune}/{num_channels} channels based on ActivationxGradient...")
     
     with torch.no_grad():
         target_layer.weight[top_indices, :, :, :] = 0.0
         if target_layer.bias is not None:
             target_layer.bias[top_indices] = 0.0
             
+    model.zero_grad()
     return model
 
 def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--prune-ratio', type=float, default=0.01)
+    parser.add_argument('--lambda-l2', type=float, default=1000.0)
+    parser.add_argument('--lr', type=float, default=1e-4)
+    parser.add_argument('--epochs', type=int, default=20)
+    parser.add_argument('--output-model', type=str, default='data/advanced_depoisoned_model.pth')
+    args = parser.parse_args()
+
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    print(f"Using device: {device}")
+    print(f"Configuration: prune_ratio={args.prune_ratio}, lambda_l2={args.lambda_l2}, lr={args.lr}, epochs={args.epochs}")
 
     checkpoint_path = 'data/poisoned_model/poisoned_model.pth'
-    if not os.path.exists(checkpoint_path):
-        print(f"Error: {checkpoint_path} not found.")
-        return
-
     checkpoint = torch.load(checkpoint_path, map_location='cpu')
     state_dict = checkpoint['model'] if (isinstance(checkpoint, dict) and 'model' in checkpoint) else checkpoint
     if list(state_dict.keys())[0].startswith('module.'):
@@ -113,42 +116,42 @@ def main():
     dataset = UnlearnDataset('data/unlearn_set')
     data_loader = DataLoader(dataset, batch_size=4, shuffle=True, collate_fn=collate_fn)
 
-    # 1. High-Activation Pruning
-    model = prune_high_activations(model, data_loader, device, prune_ratio=0.02) # 2% pruning
+    # 1. ActivationxGradient Pruning
+    model = prune_taylor_expansion(model, data_loader, device, prune_ratio=args.prune_ratio)
 
-    # 2. Weight Anchoring (Simplified EWC) setup
+    # 2. Architecture Freezing
+    print("Freezing Backbone and Regression Head...")
+    for param in model.backbone.body.parameters():
+        param.requires_grad = False
+    for param in model.head.regression_head.parameters():
+        param.requires_grad = False
+    # BN layers in backbone are frozen, FPN and Classification Head remain trainable
+
+    # 3. Weight Anchoring Setup
     original_model = copy.deepcopy(model)
     original_model.eval()
     for param in original_model.parameters():
         param.requires_grad = False
 
     model.train()
-    optimizer = torch.optim.Adam(model.parameters(), lr=0.0001)
+    optimizer = torch.optim.Adam(filter(lambda p: p.requires_grad, model.parameters()), lr=args.lr)
 
-    num_epochs = 20
-    lambda_l2 = 5000.0 # Aggressive weight anchor for clean performance preservation
-
-    print(f"Starting advanced unlearning for {num_epochs} epochs with Weight Anchoring (lambda={lambda_l2})...")
-    for epoch in range(num_epochs):
-        epoch_loss = 0
-        unlearn_loss_total = 0
-        anchor_loss_total = 0
+    for epoch in range(args.epochs):
+        epoch_loss, unlearn_loss_total, anchor_loss_total = 0, 0, 0
         
         for images, targets in data_loader:
             images = list(image.to(device) for image in images)
             targets = [{k: v.to(device) for k, v in t.items()} for t in targets]
 
-            # Unlearn Focal Loss
             loss_dict = model(images, targets)
             unlearn_loss = sum(loss for loss in loss_dict.values())
 
-            # Calculate L2 distance to original weights
             l2_loss = 0.0
             for (name, param), (name_orig, param_orig) in zip(model.named_parameters(), original_model.named_parameters()):
                 if param.requires_grad:
                     l2_loss += torch.sum((param - param_orig) ** 2)
 
-            total_loss = unlearn_loss + (lambda_l2 * l2_loss)
+            total_loss = unlearn_loss + (args.lambda_l2 * l2_loss)
 
             optimizer.zero_grad()
             total_loss.backward()
@@ -158,10 +161,10 @@ def main():
             unlearn_loss_total += unlearn_loss.item()
             anchor_loss_total += l2_loss.item()
             
-        print(f"Epoch [{epoch+1}/{num_epochs}], Total: {epoch_loss/len(data_loader):.4f} | Unlearn: {unlearn_loss_total/len(data_loader):.4f} | Anchor L2: {anchor_loss_total/len(data_loader):.6f}")
+        print(f"Epoch [{epoch+1}/{args.epochs}], Total: {epoch_loss/len(data_loader):.4f} | Unlearn: {unlearn_loss_total/len(data_loader):.4f} | Anchor L2: {anchor_loss_total/len(data_loader):.6f}")
 
-    torch.save(model.state_dict(), 'data/advanced_depoisoned_model.pth')
-    print("Saved advanced de-poisoned model to data/advanced_depoisoned_model.pth")
+    torch.save(model.state_dict(), args.output_model)
+    print(f"Saved model to {args.output_model}")
 
 if __name__ == '__main__':
     main()
