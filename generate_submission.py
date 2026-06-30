@@ -1,12 +1,20 @@
 import os
 import argparse
 import torch
-import torchvision
-from torch.utils.data import Dataset, DataLoader
 import numpy as np
 from PIL import Image
 import pandas as pd
 from torchvision.ops import nms
+
+try:
+    from detectron2.config import get_cfg
+    from detectron2.modeling import build_model
+    from detectron2.checkpoint import DetectionCheckpointer
+    from detectron2 import model_zoo
+except ImportError:
+    print("Warning: detectron2 is not installed. Script is adapted for Kaggle environments.")
+
+from torch.utils.data import Dataset, DataLoader
 
 class TestDataset(Dataset):
     def __init__(self, img_dir):
@@ -22,45 +30,46 @@ class TestDataset(Dataset):
         image_id = int(os.path.splitext(img_name)[0])
         
         image = Image.open(img_path)
-        image_np = np.array(image, dtype=np.float32) / 65535.0
+        image_np = np.array(image, dtype=np.float32)
         
-        image_tensor = torch.tensor(image_np)
-        if len(image_tensor.shape) == 2:
-            image_tensor = image_tensor.unsqueeze(0)
-        if image_tensor.shape[0] == 1:
-            image_tensor = image_tensor.repeat(3, 1, 1)
+        if len(image_np.shape) == 2:
+            image_np = np.expand_dims(image_np, axis=0)
+        if image_np.shape[0] == 1:
+            image_np = np.repeat(image_np, 3, axis=0)
 
-        return image_tensor, image_id
+        image_tensor = torch.tensor(image_np)
+        return {"image": image_tensor, "image_id": image_id}
 
 def collate_fn(batch):
-    return tuple(zip(*batch))
+    return batch
+
+def setup_cfg():
+    cfg = get_cfg()
+    cfg.merge_from_file(model_zoo.get_config_file("COCO-Detection/retinanet_R_50_FPN_3x.yaml"))
+    cfg.MODEL.RETINANET.NUM_CLASSES = 1
+    return cfg
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--models', nargs='+', default=['data/advanced_depoisoned_model.pth'], help='Paths to model checkpoints for ensembling')
-    parser.add_argument('--iou-thresh', type=float, default=0.5, help='NMS IoU threshold')
-    parser.add_argument('--conf-thresh', type=float, default=0.2, help='Confidence threshold')
+    parser.add_argument('--models', nargs='+', default=['data/advanced_depoisoned_model.pth'])
+    parser.add_argument('--iou-thresh', type=float, default=0.5)
+    parser.add_argument('--conf-thresh', type=float, default=0.2)
     args = parser.parse_args()
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Using device: {device}")
 
+    cfg = setup_cfg()
+    
     models = []
     for path in args.models:
         if not os.path.exists(path):
             print(f"Error: {path} not found.")
             return
             
-        checkpoint = torch.load(path, map_location='cpu')
-        state_dict = checkpoint['model'] if (isinstance(checkpoint, dict) and 'model' in checkpoint) else checkpoint
-        if list(state_dict.keys())[0].startswith('module.'):
-            state_dict = {k.replace('module.', ''): v for k, v in state_dict.items()}
-
-        cls_weight = state_dict.get('head.classification_head.cls_logits.weight')
-        num_classes = cls_weight.shape[0] // 9 if cls_weight is not None else 2
-        
-        model = torchvision.models.detection.retinanet_resnet50_fpn(num_classes=num_classes, weights=None, weights_backbone=None)
-        model.load_state_dict(state_dict)
+        model = build_model(cfg)
+        checkpointer = DetectionCheckpointer(model)
+        checkpointer.load(path)
         model.to(device)
         model.eval()
         models.append(model)
@@ -74,25 +83,25 @@ def main():
     
     print("Starting ensemble inference...")
     with torch.no_grad():
-        for images, image_ids in data_loader:
-            images = list(img.to(device) for img in images)
-            
-            batch_boxes = [[] for _ in range(len(images))]
-            batch_scores = [[] for _ in range(len(images))]
-            batch_labels = [[] for _ in range(len(images))]
+        for batch in data_loader:
+            for d in batch:
+                d["image"] = d["image"].to(device)
+                
+            batch_boxes = [[] for _ in range(len(batch))]
+            batch_scores = [[] for _ in range(len(batch))]
+            batch_labels = [[] for _ in range(len(batch))]
             
             for model in models:
-                outputs = model(images)
+                outputs = model(batch)
                 for i, output in enumerate(outputs):
-                    batch_boxes[i].append(output['boxes'])
-                    batch_scores[i].append(output['scores'])
-                    batch_labels[i].append(output['labels'])
+                    instances = output["instances"]
+                    batch_boxes[i].append(instances.pred_boxes.tensor)
+                    batch_scores[i].append(instances.scores)
+                    batch_labels[i].append(instances.pred_classes)
                     
-            for i, image_id in enumerate(image_ids):
-                if not batch_boxes[i]:
-                    results.append({'image_id': image_id, 'prediction_string': " "})
-                    continue
-                    
+            for i, d in enumerate(batch):
+                image_id = d["image_id"]
+                
                 boxes = torch.cat(batch_boxes[i])
                 scores = torch.cat(batch_scores[i])
                 labels = torch.cat(batch_labels[i])

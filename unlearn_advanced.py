@@ -3,10 +3,18 @@ import argparse
 import copy
 import torch
 import torch.nn as nn
-import torchvision
-from torch.utils.data import Dataset, DataLoader
 import numpy as np
 from PIL import Image
+
+try:
+    from detectron2.config import get_cfg
+    from detectron2.modeling import build_model
+    from detectron2.checkpoint import DetectionCheckpointer
+    from detectron2 import model_zoo
+except ImportError:
+    print("Warning: detectron2 is not installed. Script is adapted for Kaggle environments.")
+
+from torch.utils.data import Dataset, DataLoader
 
 class UnlearnDataset(Dataset):
     def __init__(self, img_dir):
@@ -19,27 +27,36 @@ class UnlearnDataset(Dataset):
     def __getitem__(self, idx):
         img_path = os.path.join(self.img_dir, self.img_names[idx])
         image = Image.open(img_path)
-        image_np = np.array(image, dtype=np.float32) / 65535.0
+        image_np = np.array(image, dtype=np.float32)
         
+        # Convert to C, H, W
+        if len(image_np.shape) == 2:
+            image_np = np.expand_dims(image_np, axis=0)
+        if image_np.shape[0] == 1:
+            image_np = np.repeat(image_np, 3, axis=0)
+            
+        from detectron2.structures import Instances, Boxes
         image_tensor = torch.tensor(image_np)
-        if len(image_tensor.shape) == 2:
-            image_tensor = image_tensor.unsqueeze(0)
-        if image_tensor.shape[0] == 1:
-            image_tensor = image_tensor.repeat(3, 1, 1)
-
-        target = {
-            "boxes": torch.zeros((0, 4), dtype=torch.float32),
-            "labels": torch.zeros(0, dtype=torch.int64)
-        }
-        return image_tensor, target
+        
+        # Provide empty instances to force unlearning
+        target = Instances((image_tensor.shape[1], image_tensor.shape[2]))
+        target.gt_boxes = Boxes(torch.zeros((0, 4), dtype=torch.float32))
+        target.gt_classes = torch.zeros(0, dtype=torch.int64)
+        
+        return {"image": image_tensor, "instances": target}
 
 def collate_fn(batch):
-    return tuple(zip(*batch))
+    return batch
+
+def setup_cfg():
+    cfg = get_cfg()
+    cfg.merge_from_file(model_zoo.get_config_file("COCO-Detection/retinanet_R_50_FPN_3x.yaml"))
+    cfg.MODEL.RETINANET.NUM_CLASSES = 1 # Update if competition requires more classes
+    return cfg
 
 def prune_taylor_expansion(model, data_loader, device, prune_ratio):
     print("Running forward and backward pass to identify poison-trigger neurons via ActivationxGradient...")
-    model.train() # Must be in train mode for backward pass
-    
+    model.train()
     activations = []
     
     def hook_fn(m, i, o):
@@ -47,21 +64,24 @@ def prune_taylor_expansion(model, data_loader, device, prune_ratio):
         activations.append(o)
         
     target_layer = None
-    for name, module in model.head.classification_head.named_modules():
-        if isinstance(module, nn.Conv2d):
-            target_layer = module
-            h = module.register_forward_hook(hook_fn)
-            break
+    if hasattr(model, 'head') and hasattr(model.head, 'cls_subnet'):
+        for name, module in model.head.cls_subnet.named_modules():
+            if isinstance(module, nn.Conv2d):
+                target_layer = module
+                h = target_layer.register_forward_hook(hook_fn)
+                break
 
     if target_layer is None:
-        print("Warning: Could not find Conv2d in classification head to prune.")
+        print("Warning: Could not find Conv2d in classification subnet to prune.")
         return model
 
     model.zero_grad()
-    for images, targets in data_loader:
-        images = list(image.to(device) for image in images)
-        targets = [{k: v.to(device) for k, v in t.items()} for t in targets]
-        loss_dict = model(images, targets)
+    for batch in data_loader:
+        for d in batch:
+            d["image"] = d["image"].to(device)
+            d["instances"] = d["instances"].to(device)
+            
+        loss_dict = model(batch)
         loss = sum(l for l in loss_dict.values())
         loss.backward()
             
@@ -70,7 +90,6 @@ def prune_taylor_expansion(model, data_loader, device, prune_ratio):
     scores = torch.zeros(target_layer.out_channels, device=device)
     for act in activations:
         if act.grad is not None:
-            # Taylor Expansion Score: |Activation * Gradient|
             score = (act * act.grad).abs().mean(dim=(0, 2, 3))
             scores += score
             
@@ -100,17 +119,12 @@ def main():
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Configuration: prune_ratio={args.prune_ratio}, lambda_l2={args.lambda_l2}, lr={args.lr}, epochs={args.epochs}")
 
+    cfg = setup_cfg()
+    model = build_model(cfg)
+    
     checkpoint_path = 'data/poisoned_model/poisoned_model.pth'
-    checkpoint = torch.load(checkpoint_path, map_location='cpu')
-    state_dict = checkpoint['model'] if (isinstance(checkpoint, dict) and 'model' in checkpoint) else checkpoint
-    if list(state_dict.keys())[0].startswith('module.'):
-        state_dict = {k.replace('module.', ''): v for k, v in state_dict.items()}
-
-    cls_weight = state_dict.get('head.classification_head.cls_logits.weight')
-    num_classes = cls_weight.shape[0] // 9 if cls_weight is not None else 2
-
-    model = torchvision.models.detection.retinanet_resnet50_fpn(num_classes=num_classes, weights=None, weights_backbone=None)
-    model.load_state_dict(state_dict)
+    checkpointer = DetectionCheckpointer(model)
+    checkpointer.load(checkpoint_path)
     model.to(device)
 
     dataset = UnlearnDataset('data/unlearn_set')
@@ -121,11 +135,13 @@ def main():
 
     # 2. Architecture Freezing
     print("Freezing Backbone and Regression Head...")
-    for param in model.backbone.body.parameters():
+    for param in model.backbone.bottom_up.parameters():
         param.requires_grad = False
-    for param in model.head.regression_head.parameters():
+    for param in model.head.bbox_subnet.parameters():
         param.requires_grad = False
-    # BN layers in backbone are frozen, FPN and Classification Head remain trainable
+    if hasattr(model.head, 'bbox_pred'):
+        for param in model.head.bbox_pred.parameters():
+            param.requires_grad = False
 
     # 3. Weight Anchoring Setup
     original_model = copy.deepcopy(model)
@@ -139,11 +155,12 @@ def main():
     for epoch in range(args.epochs):
         epoch_loss, unlearn_loss_total, anchor_loss_total = 0, 0, 0
         
-        for images, targets in data_loader:
-            images = list(image.to(device) for image in images)
-            targets = [{k: v.to(device) for k, v in t.items()} for t in targets]
+        for batch in data_loader:
+            for d in batch:
+                d["image"] = d["image"].to(device)
+                d["instances"] = d["instances"].to(device)
 
-            loss_dict = model(images, targets)
+            loss_dict = model(batch)
             unlearn_loss = sum(loss for loss in loss_dict.values())
 
             l2_loss = 0.0
@@ -163,7 +180,8 @@ def main():
             
         print(f"Epoch [{epoch+1}/{args.epochs}], Total: {epoch_loss/len(data_loader):.4f} | Unlearn: {unlearn_loss_total/len(data_loader):.4f} | Anchor L2: {anchor_loss_total/len(data_loader):.6f}")
 
-    torch.save(model.state_dict(), args.output_model)
+    # Save only the state dict for Detectron2 compatibility
+    torch.save({"model": model.state_dict()}, args.output_model)
     print(f"Saved model to {args.output_model}")
 
 if __name__ == '__main__':
